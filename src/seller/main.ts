@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { DatabaseExceptionFilter } from './http-errors';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'] });
@@ -12,6 +13,7 @@ async function bootstrap() {
       forbidNonWhitelisted: true,
     }),
   );
+  app.useGlobalFilters(new DatabaseExceptionFilter());
   app.enableShutdownHooks();
   app.useLogger(new Logger());
   const port = Number(process.env.PORT ?? 3000);

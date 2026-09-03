@@ -26,6 +26,7 @@ function spawnSeller(port: number): ChildProcess {
       DATABASE_URL: process.env.DATABASE_URL ?? 'postgres://tickets:tickets@127.0.0.1:5432/tickets',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
   });
   child.stdout?.on('data', (buf) => process.stdout.write(`[seller:${port}] ${buf}`));
   child.stderr?.on('data', (buf) => process.stderr.write(`[seller:${port}] ${buf}`));
@@ -46,12 +47,37 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
   throw new Error(`seller at ${url} did not become healthy`);
 }
 
-async function stop(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill('SIGTERM');
-  await sleep(400);
-  if (child.exitCode === null && child.signalCode === null) {
-    child.kill('SIGKILL');
+async function waitUntilDown(url: string, timeoutMs = 8_000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await fetch(`${url}/health`, { signal: AbortSignal.timeout(400) });
+      await sleep(100);
+    } catch {
+      return;
+    }
+  }
+}
+
+async function stop(child: ChildProcess, port: number): Promise<void> {
+  if (child.pid) {
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+    } catch {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // already gone
+      }
+    }
+  }
+  await waitUntilDown(`http://127.0.0.1:${port}`);
+  if (child.pid) {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
   }
 }
 
@@ -85,7 +111,7 @@ async function main() {
     save('01-naive', naiveReport);
     reports.naive = naiveReport;
   } finally {
-    await stop(naive);
+    await stop(naive, 3000);
     await sleep(300);
   }
 
@@ -228,7 +254,7 @@ async function main() {
     save('04-slow-db', slow);
     reports.slow = slow;
   } finally {
-    await stop(correct);
+    await stop(correct, 3000);
     await sleep(300);
   }
 
@@ -271,9 +297,9 @@ async function main() {
     });
     save('05-three-instances-naive', naiveMulti);
   } finally {
-    await stop(s1);
-    await stop(s2);
-    await stop(s3);
+    await stop(s1, 3001);
+    await stop(s2, 3002);
+    await stop(s3, 3003);
   }
 
   console.log('\n==== demo complete ====\n');

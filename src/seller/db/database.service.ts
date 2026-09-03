@@ -15,6 +15,9 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       idleTimeoutMillis: 10_000,
       connectionTimeoutMillis: 5_000,
     });
+    this.pool.on('error', (err) => {
+      console.error(`idle postgres client error: ${err.message}`);
+    });
   }
 
   async onModuleInit(): Promise<void> {
@@ -33,10 +36,21 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
   async withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let failed = false;
     try {
       return await fn(client);
+    } catch (err) {
+      failed = true;
+      try {
+        client.release(true);
+      } catch {
+        // already dead
+      }
+      throw err;
     } finally {
-      client.release();
+      if (!failed) {
+        client.release();
+      }
     }
   }
 }

@@ -2,7 +2,7 @@
 
 Fifty thousand people want a hundred tickets, and they all arrive in the same sixty seconds.
 
-This repo is a NestJS + PostgreSQL seller, a load-generating buyer, and a write-up of what breaks under that load. Docker Compose runs three seller replicas behind nginx; the same code also runs against a local Postgres for development.
+This repo is a NestJS + PostgreSQL seller, a load-generating buyer, and a write-up of what actually happens under that load. Docker Compose runs three seller replicas behind nginx; the same code runs against local Postgres.
 
 ## What the problem is actually asking
 
@@ -10,20 +10,20 @@ It is not a CRUD exercise. It is four invariants under contention:
 
 1. **Capacity** — never sell more tickets than exist.
 2. **Uniqueness** — never issue the same ticket number twice.
-3. **Idempotency** — if the same `requestId` is retried (client timeout, double-click, load-balancer retry), the buyer gets *one* ticket, not two.
+3. **Idempotency** — if the same `requestId` is retried (timeout, double-click, proxy retry), the buyer gets *one* ticket, not two.
 4. **Accountability** — `GET /status` reports a sold count that matches the tickets actually issued.
 
-`/buy` that is correct on a single request and wrong at 5,000 concurrent requests is wrong. Speed only counts after those four hold.
+A `/buy` that is correct on one request and wrong at 5,000 concurrent requests is wrong. Speed only counts after those four hold.
 
-The "naive version first" requirement is there because a buyer that cannot break a lockless check-then-act is not generating real contention. The extra credit (three instances, killed datastore, waitlist, distributed buyer) exists because the single-process mutex that people reach for does not survive a second replica.
+The "naive version first" requirement is there because a buyer that cannot break a lockless check-then-act is not generating real contention. The extra credit (three instances, killed datastore, waitlist, distributed buyer) exists because the single-process mutex people reach for does not survive a second replica.
 
 ## Why NestJS + Postgres
 
 | Choice | Reason |
 | --- | --- |
-| **PostgreSQL** | The lock has to live *outside* the Node process. Row locks, `FOR UPDATE SKIP LOCKED`, and a partial unique index on `(sale_id, request_id)` are the actual concurrency control. Three Nest instances with no app-level mutex still serialize on the same rows. |
+| **PostgreSQL** | The lock has to live *outside* the Node process. Row locks, `FOR UPDATE SKIP LOCKED`, and a partial unique index on `(sale_id, request_id)` are the concurrency control. Three Nest instances with no app-level mutex still serialize on the same rows. |
 | **NestJS** | Thin HTTP layer: validation, three endpoints, one transaction. The interesting code is SQL, not decorators. |
-| **Docker Compose** | Postgres + three sellers + nginx, so the multi-instance case is one command, not a story. |
+| **Docker Compose** | Postgres + three sellers + nginx, so the multi-instance case is one command. |
 
 Redis `INCR` can do a fast counter but is a weaker source of truth for "this request id owns ticket 17" once you care about crash recovery. An in-memory mutex is faster still and is also how you oversell the moment a second process starts.
 
@@ -33,8 +33,8 @@ Redis `INCR` can do a fast counter but is a weaker source of truth for "this req
 sales (id, total_tickets, mode, created_at)
 
 tickets (
-  sale_id,          -- FK
-  ticket_number,    -- PK with sale_id: the uniqueness invariant
+  sale_id,          -- FK, part of PK
+  ticket_number,    -- PK with sale_id: uniqueness invariant
   user_id,          -- NULL until claimed
   request_id,       -- NULL until claimed
   purchased_at
@@ -45,11 +45,13 @@ CREATE UNIQUE INDEX tickets_sale_request_uidx
   ON tickets (sale_id, request_id)
   WHERE request_id IS NOT NULL;
 
-current_sale (lock, sale_id)   -- singleton pointer every replica reads
-faults (lock, db_delay_ms, until_ts)  -- shared slow-DB switch
+current_sale (lock, sale_id)              -- singleton pointer every replica reads
+faults (lock, db_delay_ms, until_ts)      -- shared slow-DB switch
 ```
 
-`POST /reset` with `mode=correct` pre-inserts `total_tickets` unsold rows. Claiming is an `UPDATE`, not "read max(ticket_number)+1 then insert". Computing the next number is the race.
+`POST /reset` with `mode=correct` pre-inserts `total_tickets` unsold rows. Claiming is an `UPDATE`, not "read `max(ticket_number)+1` then insert". Computing the next number is the race.
+
+Full DDL: `src/seller/db/schema.sql`.
 
 ## APIs
 
@@ -59,7 +61,7 @@ faults (lock, db_delay_ms, until_ts)  -- shared slow-DB switch
 { "ticketCount": 100, "mode": "naive" | "correct" }
 ```
 
-Wipes the active sale. `naive` uses in-process memory (no mutex). `correct` uses Postgres.
+Wipes the active sale. `naive` uses in-process memory with no mutex. `correct` uses Postgres.
 
 ### `POST /buy`
 
@@ -69,8 +71,9 @@ Wipes the active sale. `naive` uses in-process memory (no mutex). `correct` uses
 
 | HTTP | Body | Meaning |
 | --- | --- | --- |
-| 200 | `{ "status": "ok", "ticketNumber": 17, "userId", "requestId", "replay" }` | Ticket issued, or the same ticket returned for a retry |
+| 200/201 | `{ "status": "ok", "ticketNumber": 17, "userId", "requestId", "replay" }` | Ticket issued, or the same ticket returned for a retry |
 | 409 | `{ "status": "sold_out" }` | Nothing left |
+| 503 | `{ "status": "unavailable" }` | Datastore is down; nothing was committed |
 
 `replay: true` means this `requestId` already owned a ticket.
 
@@ -88,8 +91,8 @@ Wipes the active sale. `naive` uses in-process memory (no mutex). `correct` uses
 
 ### Extra (experiments, not in the spec)
 
-- `GET /health` — liveness + `instanceId` so you can see the load balancer move.
-- `POST /faults` `{ "dbDelayMs": 200, "durationSeconds": 10 }` — every replica sleeps in Postgres (`pg_sleep`) before opening a buy transaction.
+- `GET /health` — liveness + `instanceId` so you can see requests land on different replicas.
+- `POST /faults` `{ "dbDelayMs": 200, "durationSeconds": 10 }` — every replica runs `pg_sleep` before opening a buy transaction.
 
 ## How a ticket is claimed (correct path)
 
@@ -132,13 +135,11 @@ await setTimeout(5);                 // other requests interleave here
 this.tickets.push({ ticketNumber: this.tickets.length + 1, ... });
 ```
 
-Hundreds of in-flight requests all observe `length < 100`, all pass, all push. Ticket numbers collide. Duplicate `requestId`s both win. `/status` faithfully reports the mess — invariant 4 holds, 1–3 do not — which is the point: the buyer must catch this.
-
-Across three naive replicas it is worse: each process has its own counter, so you can sell 100 per replica.
+Hundreds of in-flight requests all observe `length < 100`, all pass, all push. Duplicate `requestId`s both win. Across three naive replicas it is worse: each process has its own counter, so ticket number 1 is issued three times.
 
 ## Run it
 
-### Local (this is what the demo uses)
+### Local
 
 Postgres 16 on `127.0.0.1:5432`, database/user/password `tickets`.
 
@@ -153,6 +154,7 @@ Full recorded run (naive fail, correct pass, sweep, slow DB, three instances):
 
 ```bash
 npm run demo
+npm run chaos                  # kill Postgres mid-sale and bring it back
 ```
 
 Reports land in `runs/*.json`.
@@ -183,52 +185,109 @@ It prints req/s, p50, p99, and PASS/FAIL on each invariant.
 
 ## Recorded runs
 
-Numbers below come from `npm run demo` on this machine. Re-run it; they will move, the pass/fail column should not.
+From `npm run demo`, a 50k stampede, and `npm run chaos` on this machine.
 
-### 1. Naive — buyer catches the oversell
+### 1. Naive — the buyer catches the oversell
 
-See `runs/01-naive.json`.
+`runs/01-naive.json` — 3,000 unique buys + 450 replays, concurrency 300, 100 tickets.
 
-Expected: **FAIL**. `status.sold` well above 100, duplicate ticket numbers, duplicate `requestId`s receiving two seats.
+| | |
+| --- | --- |
+| Result | **FAIL** |
+| Throughput | 2,526 req/s |
+| p50 / p99 | 104 ms / 300 ms |
+| `status.sold` | **176 / 100** |
+| Idempotency | 1 request id received two distinct ticket numbers |
+
+Invariant 1 fails (oversold). Invariant 3 fails (one `requestId` mapped to two seats). Invariant 4 fails (`sold=176` vs 175 unique request ids). Ticket numbers on a single process happened to stay unique (`length + 1` after the yield still counts up); they do **not** stay unique once a second process starts — see run 5.
 
 ### 2. Correct — four invariants hold
 
-See `runs/02-correct.json`.
+`runs/02-correct.json` — 5,000 unique buys + 750 replays, concurrency 400.
 
-Expected: **PASS**. Exactly 100 tickets, unique numbers 1–100, replays return the original ticket, `sold === tickets.length`.
+| | |
+| --- | --- |
+| Result | **PASS** |
+| Throughput | 2,757 req/s |
+| p50 / p99 | 118 ms / 335 ms |
+| `status.sold` | **100 / 100** |
+| Winning request ids | 100 |
+| Unique ticket numbers | 100 |
 
-### 3. Where latency degrades
+Same buyer, same shape of load. The only change is `mode=correct`.
 
-See `runs/03-sweep-summary.json`.
+50,000 unique buyers + 5,000 replays (the actual stampede size) also **PASS**: 55,000 HTTP calls in 16.9s at 3,246 req/s, sold exactly 100, zero errors (`runs/07-stampede-50k.json`).
 
-The buyer sends 4000 requests at concurrency 50, 100, 200, 400, 800. Compare:
+### 3. Where latency degrades — and how we know
 
-- **Client latency p99** vs **`Server-Timing` p99**. If they move together, time is spent in the seller/Postgres, not on the wire.
-- **req/s** as concurrency grows. When RPS flattens while p99 climbs, the pool or Postgres is saturated (`PG_POOL_MAX` defaults to 20).
+`runs/03-sweep-summary.json` — 4,000 buys, 100 tickets, concurrency 50 → 800. Every row **PASS**.
 
-Two buyer processes in parallel (`runs/02b-distributed-buyer.json`) answer "is my client the bottleneck?": if combined RPS of A+B is not much higher than one buyer, the seller is the limit.
+| concurrency | req/s | client p50 | client p99 | server p50 | server p99 |
+| --- | --- | --- | --- | --- | --- |
+| 50 | **4,565** | 10 ms | 26 ms | 7 ms | 14 ms |
+| 100 | 4,288 | 23 ms | 47 ms | 19 ms | 28 ms |
+| 200 | 4,345 | 44 ms | 88 ms | 40 ms | 51 ms |
+| 400 | 4,232 | 90 ms | 141 ms | 85 ms | 102 ms |
+| 800 | 4,076 | 176 ms | 364 ms | 167 ms | 202 ms |
+
+Throughput is already capped at ~4.1–4.5k req/s by concurrency 50. Raising concurrency does not buy RPS; it only queues. Client p50 and `Server-Timing` p50 move together, so the time is spent inside the seller (Postgres checkout + the sold-out `SKIP LOCKED` query), not on the wire.
+
+The pool is 20 connections (`PG_POOL_MAX`). At concurrency 800, ~780 requests wait for a client. That is the p99.
+
+Two buyer processes in parallel (`runs/02b-distributed-buyer.json`) combined for 4,119 req/s — the same ceiling as one buyer at concurrency 50. Adding a second client does not raise throughput. The seller / Postgres is the limit, not the load generator.
 
 ### 4. Datastore slow for ten seconds
 
-`POST /faults` `{ "dbDelayMs": 200, "durationSeconds": 10 }` runs `SELECT pg_sleep(0.2)` on every buy *before* `BEGIN`, so connections are held but ticket rows are not.
+`POST /faults` `{ "dbDelayMs": 200, "durationSeconds": 10 }` runs `SELECT pg_sleep(0.2)` on every buy *before* `BEGIN`, so connections are held but ticket rows are not locked.
 
-Expected: throughput collapses toward `pool_size / 0.2s` (~100 req/s with 20 connections) for ten seconds, then recovers. **No oversell.** Slow is not incorrect.
+`runs/04-slow-db.json`:
 
-### 5. Three instances, no app lock
+| | |
+| --- | --- |
+| Result | **PASS** (still exactly 100 sold) |
+| Throughput | 209 req/s (down from ~4,000) |
+| p99 | 1,023 ms |
+| Duration | 10.5 s for 2,200 calls |
 
-Buyer round-robins `:3001,:3002,:3003`. Each response carries `X-Instance-Id`. You should see all three pids in `byInstance`. Invariants still **PASS**.
+Ceiling during the fault is roughly `pool_size / 0.2s` ≈ 100 req/s, plus queueing. After the 10s window, the remaining requests are fast, which is why p50 is 49 ms while p99 is a full second. Slow is not incorrect.
 
-The same topology with `--mode naive` **FAILS** — each process sells its own 100.
+### 5. Three instances, no application lock
 
-## Take it further: what we solved vs what we skipped
+Buyer round-robins `:3001,:3002,:3003`. Responses carry `X-Instance-Id`.
 
-**Solved: three instances behind a balancer, no application lock.** Postgres row locks + unique index. That is a different problem from `Mutex` in one process, and it is the one this stack is for.
+Correct (`runs/05-three-instances.json`): **PASS**. 9,600 calls, sold 100/100. Traffic split exactly 3,200 / 3,200 / 3,200 across the three pids. Postgres is the lock.
 
-**Skipped on purpose (do one properly):**
+Naive on the same topology (`runs/05-three-instances-naive.json`): **FAIL**. Client saw **336 winning request ids** for a 100-ticket sale. 115 ticket numbers were handed to multiple request ids (each process issued its own 1, 2, 3, …). `/status` on one replica reported 116 — it cannot see the other processes' memory. This is why an in-process mutex is not an answer.
 
-- **Waitlist / 30s reservation.** Turns a counter into a state machine (`available → reserved → confirmed | expired → available`). The first race is "expire and grant" happening twice. Same `SKIP LOCKED` pattern on a `reserved_until` column, plus a sweeper. Not wired up here because it is a product on top of the same claim primitive.
-- **Kill Postgres mid-sale.** Confirmed (`COMMIT`ted) rows survive. In-flight requests error. After the database is back, node-pg opens new connections and `/status` still matches committed tickets. The unique index still prevents a replay from taking a second seat. Worth a manual `sudo service postgresql restart` during a run; the demo does not depend on it.
-- **Distributed buyer as separate machines.** Two concurrent buyer processes in the demo are the same proof: if adding a second client does not raise RPS, you were not client-bound.
+### 6. Kill Postgres in the middle of a sale
+
+`npm run chaos` → `runs/06-kill-postgres.json`.
+
+1. Sell 25 tickets and confirm them to buyers.
+2. `sudo service postgresql stop`.
+3. Fire 40 more `/buy`s.
+4. Start Postgres again.
+5. Finish the sale.
+
+| | |
+| --- | --- |
+| Result | **PASS** |
+| Confirmed before kill | 25 |
+| Buys while down | 40 errors, **0 tickets issued** |
+| Immediately after restore | still 25, all 25 `requestId`s present |
+| After draining the rest of the sale | **100 / 100**, unique numbers, unique request ids |
+
+The seller process stays up (idle `pg` clients emit `error`; we log and drop them instead of crashing). In-flight requests get 503. Committed rows survive. Uncommitted work rolls back. A replay of a confirmed `requestId` after restore returns the original ticket, not a new one.
+
+## Take it further
+
+**Solved: three instances behind a balancer, no application lock.** Postgres row locks + unique index. Different problem from a mutex in one process, and the one this stack is for.
+
+**Solved: kill the datastore mid-sale.** Confirmed tickets survive; nothing is issued while Postgres is down; the sale finishes at 100.
+
+**Solved: prove the client is not the bottleneck.** Sweep RPS is flat from concurrency 50; a second buyer process does not raise combined RPS.
+
+**Not built: waitlist / 30s reservation.** That turns a counter into a state machine (`available → reserved → confirmed | expired → available`). The first race is "expire and grant" happening twice. Same `SKIP LOCKED` pattern on a `reserved_until` column, plus a sweeper. It is a product on top of the claim primitive above, not a different locking story.
 
 ## Project layout
 
@@ -238,5 +297,6 @@ src/seller/db/       schema.sql + pg pool
 src/seller/naive-inventory.ts
 src/buyer/           load client + invariant checks
 scripts/demo.ts      naive → correct → sweep → slow DB → 3 replicas
+scripts/chaos-db.ts  kill Postgres mid-sale
 docker-compose.yml   postgres + seller-1/2/3 + nginx :8080
 ```

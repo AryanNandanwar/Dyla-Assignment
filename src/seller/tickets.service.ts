@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { hostname } from 'node:os';
 import { PoolClient } from 'pg';
 import { DatabaseService } from './db/database.service';
@@ -83,10 +83,19 @@ export class TicketsService {
   }
 
   async buy(userId: string, requestId: string): Promise<BuyResult> {
-    if (this.mode === 'naive') {
-      return this.buyNaive(userId, requestId);
+    try {
+      if (this.mode === 'naive') {
+        return await this.buyNaive(userId, requestId);
+      }
+      return await this.buyCorrect(userId, requestId);
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (/terminating connection|ECONNREFUSED|Connection terminated|57P01|57P03/i.test(message)) {
+        throw new ServiceUnavailableException({ status: 'unavailable', message: 'datastore unavailable' });
+      }
+      throw err;
     }
-    return this.buyCorrect(userId, requestId);
   }
 
   async status() {

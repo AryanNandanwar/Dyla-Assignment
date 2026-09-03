@@ -4,3 +4,4 @@ runs/
 *.log
 .env
 .DS_Store
+agent-tools/

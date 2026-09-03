@@ -8,6 +8,7 @@
     "seller:naive": "SELLER_DEFAULT_MODE=naive tsx src/seller/main.ts",
     "buyer": "tsx src/buyer/index.ts",
     "demo": "tsx scripts/demo.ts",
+    "chaos": "tsx scripts/chaos-db.ts",
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
